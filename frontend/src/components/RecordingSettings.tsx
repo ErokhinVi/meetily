@@ -18,6 +18,27 @@ interface RecordingSettingsProps {
   onSave?: (preferences: RecordingPreferences) => void;
 }
 
+// Maps a KeyboardEvent.code to a Tauri accelerator key token.
+// Returns null for modifier-only presses (keep capturing).
+function acceleratorKeyFromCode(code: string): string | null {
+  if (/^(Meta|Control|Alt|Shift)(Left|Right)$/.test(code)) return null;
+  const letter = code.match(/^Key([A-Z])$/);
+  if (letter) return letter[1];
+  const digit = code.match(/^Digit(\d)$/);
+  if (digit) return digit[1];
+  // W3C code names (F5, Space, ArrowUp, Comma, …) are valid accelerator keys
+  return code;
+}
+
+const MOD_SYMBOLS: Record<string, string> = { Cmd: '⌘', Ctrl: '⌃', Alt: '⌥', Shift: '⇧' };
+
+function formatShortcut(shortcut: string): string {
+  return shortcut
+    .split('+')
+    .map((part) => MOD_SYMBOLS[part] ?? part)
+    .join(' ');
+}
+
 export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const [preferences, setPreferences] = useState<RecordingPreferences>({
     save_folder: '',
@@ -29,6 +50,9 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showRecordingNotification, setShowRecordingNotification] = useState(true);
+  const [recordingShortcut, setRecordingShortcut] = useState<string | null>(null);
+  const [capturingShortcut, setCapturingShortcut] = useState(false);
+  const [savingShortcut, setSavingShortcut] = useState(false);
 
   // Load recording preferences on component mount
   useEffect(() => {
@@ -67,6 +91,72 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     };
     loadNotificationPref();
   }, []);
+
+  // Load global recording shortcut
+  useEffect(() => {
+    invoke<string | null>('get_toggle_recording_shortcut')
+      .then(setRecordingShortcut)
+      .catch((error) => console.error('Failed to load recording shortcut:', error));
+  }, []);
+
+  const saveRecordingShortcut = async (value: string | null) => {
+    setSavingShortcut(true);
+    try {
+      await invoke('set_toggle_recording_shortcut', { shortcut: value });
+      setRecordingShortcut(value);
+      toast.success(
+        value
+          ? `Recording shortcut set to ${formatShortcut(value)}`
+          : 'Recording shortcut cleared'
+      );
+      await Analytics.track('recording_shortcut_changed', {
+        has_shortcut: (!!value).toString()
+      });
+    } catch (error) {
+      toast.error('Failed to set recording shortcut', {
+        description: error instanceof Error ? error.message : String(error)
+      });
+    } finally {
+      setSavingShortcut(false);
+    }
+  };
+
+  // Capture the key combination while the user is assigning a shortcut
+  useEffect(() => {
+    if (!capturingShortcut) return;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.key === 'Escape') {
+        setCapturingShortcut(false);
+        return;
+      }
+
+      const key = acceleratorKeyFromCode(e.code);
+      if (!key) return; // modifier-only press: keep waiting for the full combo
+
+      const mods: string[] = [];
+      if (e.metaKey) mods.push('Cmd');
+      if (e.ctrlKey) mods.push('Ctrl');
+      if (e.altKey) mods.push('Alt');
+      if (e.shiftKey) mods.push('Shift');
+
+      const isFunctionKey = /^F([1-9]|1\d|2[0-4])$/.test(key);
+      if (mods.length === 0 && !isFunctionKey) {
+        toast.error('Use at least one modifier key (⌘, ⌃, ⌥, ⇧) or an F-key');
+        return;
+      }
+
+      setCapturingShortcut(false);
+      void saveRecordingShortcut([...mods, key].join('+'));
+    };
+
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [capturingShortcut]);
 
   const handleAutoSaveToggle = async (enabled: boolean) => {
     const newPreferences = { ...preferences, auto_save: enabled };
@@ -225,6 +315,42 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           checked={showRecordingNotification}
           onCheckedChange={handleNotificationToggle}
         />
+      </div>
+
+      {/* Global Recording Shortcut */}
+      <div className="flex items-center justify-between p-4 border rounded-lg">
+        <div className="flex-1">
+          <div className="font-medium">Global Recording Shortcut</div>
+          <div className="text-sm text-gray-600">
+            Start or stop recording from anywhere, even when Meetily is in the background
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setCapturingShortcut((prev) => !prev)}
+            disabled={savingShortcut}
+            className={`px-3 py-2 text-sm border rounded-md transition-colors min-w-[130px] ${
+              capturingShortcut
+                ? 'border-blue-500 bg-blue-50 text-blue-700 animate-pulse'
+                : 'border-gray-300 hover:bg-gray-50'
+            }`}
+          >
+            {capturingShortcut
+              ? 'Press keys… (Esc to cancel)'
+              : recordingShortcut
+                ? formatShortcut(recordingShortcut)
+                : 'Set Shortcut'}
+          </button>
+          {recordingShortcut && !capturingShortcut && (
+            <button
+              onClick={() => void saveRecordingShortcut(null)}
+              disabled={savingShortcut}
+              className="px-3 py-2 text-sm text-gray-500 border border-gray-300 rounded-md hover:bg-gray-50 transition-colors"
+            >
+              Clear
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Device Preferences */}

@@ -53,7 +53,16 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {
     }
 }
 fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
-    focus_main_window(app);
+    toggle_recording(app, true);
+}
+
+/// Toggle recording. Shared by the tray menu and the global shortcut;
+/// the shortcut passes `focus_window = false` so it doesn't steal focus
+/// from the app the user is currently in.
+pub(crate) fn toggle_recording<R: Runtime>(app: &AppHandle<R>, focus_window: bool) {
+    if focus_window {
+        focus_main_window(app);
+    }
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
         if crate::is_recording().await {

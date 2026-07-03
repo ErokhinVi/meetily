@@ -49,6 +49,7 @@ pub mod anthropic;
 pub mod groq;
 pub mod openrouter;
 pub mod parakeet_engine;
+pub mod shortcuts;
 pub mod state;
 pub mod summary;
 pub mod tray;
@@ -406,6 +407,13 @@ pub fn run() {
     }
 
     builder
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    shortcuts::handle_shortcut_event(app, shortcut, event.state());
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
@@ -424,6 +432,9 @@ pub fn run() {
             if let Err(e) = tray::create_tray(_app.handle()) {
                 log::error!("Failed to create system tray: {}", e);
             }
+
+            // Register the user's global recording shortcut, if configured
+            shortcuts::init(_app.handle());
 
             // Initialize notification system with proper defaults
             log::info!("Initializing notification system...");
@@ -690,6 +701,9 @@ pub fn run() {
             audio::recording_preferences::get_current_audio_backend,
             audio::recording_preferences::set_audio_backend,
             audio::recording_preferences::get_audio_backend_info,
+            // Global recording shortcut commands
+            shortcuts::get_toggle_recording_shortcut,
+            shortcuts::set_toggle_recording_shortcut,
             // Language preference commands
             set_language_preference,
             // Notification system commands
