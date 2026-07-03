@@ -160,25 +160,26 @@ impl GigaamModel {
         let n_frames = features.shape()[2] as i64;
         let feature_lengths = Array1::from_vec(vec![n_frames]);
 
-        let inputs = inputs![
-            "features" => TensorRef::from_array_view(features.view())?,
-            "feature_lengths" => TensorRef::from_array_view(feature_lengths.view())?,
-        ];
-        let outputs = self.encoder.run(inputs)?;
+        // Scope the ONNX outputs (which mutably borrow self.encoder) so the
+        // borrow is released before we decode against self.vocab.
+        let (flat, t_out, vocab_size) = {
+            let inputs = inputs![
+                "features" => TensorRef::from_array_view(features.view())?,
+                "feature_lengths" => TensorRef::from_array_view(feature_lengths.view())?,
+            ];
+            let outputs = self.encoder.run(inputs)?;
+            let log_probs = outputs
+                .get("log_probs")
+                .ok_or_else(|| GigaamError::OutputNotFound("log_probs".to_string()))?
+                .try_extract_array::<f32>()?;
+            // log_probs: [1, T', V]
+            let shape = log_probs.shape();
+            let (t_out, vocab_size) = (shape[1], shape[2]);
+            let flat: Vec<f32> = log_probs.iter().copied().collect();
+            (flat, t_out, vocab_size)
+        };
 
-        let log_probs = outputs
-            .get("log_probs")
-            .ok_or_else(|| GigaamError::OutputNotFound("log_probs".to_string()))?
-            .try_extract_array::<f32>()?;
-
-        // log_probs: [1, T', V]
-        let shape = log_probs.shape();
-        let (t_out, vocab_size) = (shape[1], shape[2]);
-        let flat = log_probs
-            .as_slice()
-            .ok_or_else(|| GigaamError::OutputNotFound("log_probs contiguous".to_string()))?;
-
-        Ok(self.ctc_greedy_decode(flat, t_out, vocab_size))
+        Ok(self.ctc_greedy_decode(&flat, t_out, vocab_size))
     }
 
     /// Greedy CTC: argmax per frame, collapse repeats, drop blank, map to vocab.
