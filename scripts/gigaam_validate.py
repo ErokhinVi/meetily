@@ -166,14 +166,109 @@ def main() -> int:
     print(f"  ours (raw): {ours_raw!r}", flush=True)
     print(f"  ours      : {ours!r}", flush=True)
 
-    print("\n=== Verdict ===", flush=True)
+    print("\n=== Verdict (e2e-ctc) ===", flush=True)
     print(f"  ground truth : {GROUND_TRUTH!r}", flush=True)
     print(f"  onnx-asr     : {str(ref)!r}", flush=True)
     print(f"  ours         : {ours!r}", flush=True)
     norm = lambda s: str(s).lower().replace("!", "").replace("?", "").replace(".", "").replace(",", "").split()
+    ok_ctc = norm(ours) == norm(ref)
+    print(f"  ours ~= onnx-asr (ignoring punct/case): {ok_ctc}", flush=True)
+
+    ok_rnnt = validate_rnnt(wav, norm)
+    return 0 if (ok_ctc and ok_rnnt) else 1
+
+
+def rnnt_greedy_decode(encoded, encoded_len, decoder, joiner, blank, max_tokens=3):
+    """Port of onnx-asr _AsrWithTransducerDecoding._decoding (greedy RNN-T).
+
+    encoded: [D, T] (already transposed to time-major per frame access).
+    Returns list of token ids.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    pred_hidden = 320
+    h = np.zeros((1, 1, pred_hidden), dtype=np.float32)
+    c = np.zeros((1, 1, pred_hidden), dtype=np.float32)
+    dec_out = None  # None => decoder must run (len-2 state); else cached (len-3)
+    pending_h = h
+    pending_c = c
+
+    tokens: list[int] = []
+    t = 0
+    emitted = 0
+    while t < encoded_len:
+        if dec_out is None:
+            x = np.array([[tokens[-1] if tokens else blank]], dtype=np.int64)
+            dec_out, pending_h, pending_c = decoder.run(
+                ["dec", "h", "c"], {"x": x, "h.1": h, "c.1": c}
+            )
+        enc_t = encoded[:, t]  # [D]
+        (joint,) = joiner.run(
+            ["joint"],
+            {"enc": enc_t[None, :, None], "dec": np.transpose(dec_out, (0, 2, 1))},
+        )
+        token = int(np.squeeze(joint).argmax())
+        if token != blank:
+            h, c = pending_h, pending_c
+            dec_out = None
+            tokens.append(token)
+            emitted += 1
+        if token == blank or emitted == max_tokens:
+            t += 1
+            emitted = 0
+    return tokens
+
+
+def validate_rnnt(wav, norm) -> bool:
+    import numpy as np  # noqa: PLC0415
+    import onnx_asr  # noqa: PLC0415
+    from huggingface_hub import hf_hub_download  # noqa: PLC0415
+
+    print("\n=== e2e-rnnt: reference (onnx-asr) ===", flush=True)
+    model = onnx_asr.load_model("gigaam-v3-e2e-rnnt")
+    import soundfile as sf  # noqa: PLC0415
+
+    sf.write("sample_rnnt.wav", wav, SAMPLE_RATE)
+    ref = model.recognize("sample_rnnt.wav")
+    print(f"  onnx-asr : {ref!r}", flush=True)
+
+    print("\n=== e2e-rnnt: our reimplementation ===", flush=True)
+    enc_path = hf_hub_download("istupakov/gigaam-v3-onnx", "v3_e2e_rnnt_encoder.onnx")
+    dec_path = hf_hub_download("istupakov/gigaam-v3-onnx", "v3_e2e_rnnt_decoder.onnx")
+    joi_path = hf_hub_download("istupakov/gigaam-v3-onnx", "v3_e2e_rnnt_joint.onnx")
+    vocab_path = hf_hub_download("istupakov/gigaam-v3-onnx", "v3_e2e_rnnt_vocab.txt")
+    vocab, blank = load_vocab(vocab_path)
+
+    enc_sess = rt.InferenceSession(enc_path)
+    dec_sess = rt.InferenceSession(dec_path)
+    joi_sess = rt.InferenceSession(joi_path)
+    print("  --- encoder I/O ---", flush=True)
+    for x in enc_sess.get_inputs() + enc_sess.get_outputs():
+        print(f"    {x.name:16s} {x.shape} {x.type}", flush=True)
+    print("  --- decoder I/O ---", flush=True)
+    for x in dec_sess.get_inputs() + dec_sess.get_outputs():
+        print(f"    {x.name:16s} {x.shape} {x.type}", flush=True)
+    print("  --- joiner I/O ---", flush=True)
+    for x in joi_sess.get_inputs() + joi_sess.get_outputs():
+        print(f"    {x.name:16s} {x.shape} {x.type}", flush=True)
+
+    feats = log_mel_features(wav)[None, :, :]  # [1,64,T]
+    feat_len = np.array([feats.shape[2]], dtype=np.int64)
+    encoded, encoded_len = enc_sess.run(
+        ["encoded", "encoded_len"], {"audio_signal": feats, "length": feat_len}
+    )
+    enc = encoded[0]  # [D, T]
+    n = int(encoded_len[0])
+    tokens = rnnt_greedy_decode(enc, n, dec_sess, joi_sess, blank)
+    ours = "".join(vocab[t] for t in tokens).replace("▁", " ").strip()
+    print(f"  ours     : {ours!r}", flush=True)
+
+    print("\n=== Verdict (e2e-rnnt) ===", flush=True)
+    print(f"  onnx-asr : {str(ref)!r}", flush=True)
+    print(f"  ours     : {ours!r}", flush=True)
     ok = norm(ours) == norm(ref)
     print(f"  ours ~= onnx-asr (ignoring punct/case): {ok}", flush=True)
-    return 0 if ok else 1
+    return ok
 
 
 if __name__ == "__main__":
