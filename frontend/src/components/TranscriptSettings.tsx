@@ -7,13 +7,18 @@ import { Label } from './ui/label';
 import { Eye, EyeOff, Lock, Unlock } from 'lucide-react';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
+import { GigaAMModelManager } from './GigaAMModelManager';
 
 
 export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
+    provider: 'localWhisper' | 'parakeet' | 'gigaam' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
     model: string;
     apiKey?: string | null;
 }
+
+// Local, on-device providers that never require an API key.
+const LOCAL_PROVIDERS = ['localWhisper', 'parakeet', 'gigaam'] as const;
+const isLocalProvider = (p: string) => (LOCAL_PROVIDERS as readonly string[]).includes(p);
 
 export interface TranscriptSettingsProps {
     transcriptModelConfig: TranscriptModelProps;
@@ -34,7 +39,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     }, [transcriptModelConfig.provider]);
 
     useEffect(() => {
-        if (transcriptModelConfig.provider === 'localWhisper' || transcriptModelConfig.provider === 'parakeet') {
+        if (isLocalProvider(transcriptModelConfig.provider)) {
             setApiKey(null);
         }
     }, [transcriptModelConfig.provider]);
@@ -53,12 +58,13 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const modelOptions = {
         localWhisper: [], // Model selection handled by ModelManager component
         parakeet: [], // Model selection handled by ParakeetModelManager component
+        gigaam: [], // Model selection handled by GigaAMModelManager component
         deepgram: ['nova-2-phonecall'],
         elevenLabs: ['eleven_multilingual_v2'],
         groq: ['llama-3.3-70b-versatile'],
         openai: ['gpt-4o'],
     };
-    const requiresApiKey = transcriptModelConfig.provider === 'deepgram' || transcriptModelConfig.provider === 'elevenLabs' || transcriptModelConfig.provider === 'openai' || transcriptModelConfig.provider === 'groq';
+    const requiresApiKey = !isLocalProvider(transcriptModelConfig.provider);
 
     const handleInputClick = () => {
         if (isApiKeyLocked) {
@@ -95,6 +101,17 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         }
     };
 
+    const handleGigaamModelSelect = (modelName: string) => {
+        setTranscriptModelConfig({
+            ...transcriptModelConfig,
+            provider: 'gigaam',
+            model: modelName
+        });
+        if (onModelSelect) {
+            onModelSelect();
+        }
+    };
+
     return (
         <div>
             <div>
@@ -112,7 +129,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 onValueChange={(value) => {
                                     const provider = value as TranscriptModelProps['provider'];
                                     setUiProvider(provider);
-                                    if (provider !== 'localWhisper' && provider !== 'parakeet') {
+                                    if (!isLocalProvider(provider)) {
                                         fetchApiKey(provider);
                                     }
                                 }}
@@ -122,6 +139,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 </SelectTrigger>
                                 <SelectContent>
                                     <SelectItem value="parakeet">⚡ Parakeet (Recommended - Real-time / Accurate)</SelectItem>
+                                    <SelectItem value="gigaam">🇷🇺 GigaAM v3 (Русский — Сбер)</SelectItem>
                                     <SelectItem value="localWhisper">🏠 Local Whisper (High Accuracy)</SelectItem>
                                     {/* <SelectItem value="deepgram">☁️ Deepgram (Backup)</SelectItem>
                                     <SelectItem value="elevenLabs">☁️ ElevenLabs</SelectItem>
@@ -130,7 +148,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 </SelectContent>
                             </Select>
 
-                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && (
+                            {!isLocalProvider(uiProvider) && (
                                 <Select
                                     value={transcriptModelConfig.model}
                                     onValueChange={(value) => {
@@ -167,6 +185,16 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             <ParakeetModelManager
                                 selectedModel={transcriptModelConfig.provider === 'parakeet' ? transcriptModelConfig.model : undefined}
                                 onModelSelect={handleParakeetModelSelect}
+                                autoSave={true}
+                            />
+                        </div>
+                    )}
+
+                    {uiProvider === 'gigaam' && (
+                        <div className="mt-6">
+                            <GigaAMModelManager
+                                selectedModel={transcriptModelConfig.provider === 'gigaam' ? transcriptModelConfig.model : undefined}
+                                onModelSelect={handleGigaamModelSelect}
                                 autoSave={true}
                             />
                         </div>

@@ -135,10 +135,30 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 }
             }
         }
+        "gigaam" => {
+            info!("🔍 Validating GigaAM model...");
+            if let Err(init_error) = crate::gigaam_engine::commands::gigaam_init().await {
+                warn!("❌ Failed to initialize GigaAM engine: {}", init_error);
+                return Err(format!(
+                    "Failed to initialize GigaAM speech recognition: {}",
+                    init_error
+                ));
+            }
+            match crate::gigaam_engine::commands::gigaam_validate_model_ready_with_config(app).await {
+                Ok(model_name) => {
+                    info!("✅ GigaAM model validation successful: {} is ready", model_name);
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!("❌ GigaAM model validation failed: {}", e);
+                    Err(e)
+                }
+            }
+        }
         other => {
             warn!("❌ Unsupported transcription provider for local recording: {}", other);
             Err(format!(
-                "Provider '{}' is not supported for local transcription. Please select 'localWhisper' or 'parakeet'.",
+                "Provider '{}' is not supported for local transcription. Please select 'localWhisper', 'parakeet' or 'gigaam'.",
                 other
             ))
         }
@@ -210,6 +230,27 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 None => {
                     Err("Parakeet engine not initialized. This should not happen after validation.".to_string())
                 }
+            }
+        }
+        "gigaam" => {
+            info!("🇷🇺 Initializing GigaAM transcription engine");
+            let engine = {
+                let guard = crate::gigaam_engine::commands::GIGAAM_ENGINE.lock().unwrap();
+                guard.as_ref().cloned()
+            };
+            match engine {
+                Some(engine) if engine.is_model_loaded().await => {
+                    let provider = crate::audio::transcription::GigaamProvider::new(engine);
+                    Ok(TranscriptionEngine::Provider(Arc::new(provider)))
+                }
+                Some(_) => Err(
+                    "GigaAM engine initialized but no model loaded. This should not happen after validation."
+                        .to_string(),
+                ),
+                None => Err(
+                    "GigaAM engine not initialized. This should not happen after validation."
+                        .to_string(),
+                ),
             }
         }
         "localWhisper" | _ => {
