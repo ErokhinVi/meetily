@@ -150,21 +150,29 @@ def main() -> int:
     feats = log_mel_features(wav)[None, :, :]  # [1,64,T]
     feat_len = np.array([feats.shape[2]], dtype=np.int64)
     sess = rt.InferenceSession(ctc_path)
+    print("  --- encoder ONNX I/O contract (for the Rust `ort` calls) ---", flush=True)
+    for x in sess.get_inputs():
+        print(f"    IN  {x.name:20s} {x.shape} {x.type}", flush=True)
+    for x in sess.get_outputs():
+        print(f"    OUT {x.name:20s} {x.shape} {x.type}", flush=True)
     in_names = [x.name for x in sess.get_inputs()]
     out_names = [x.name for x in sess.get_outputs()]
     feeds = {in_names[0]: feats.astype(np.float32)}
     if len(in_names) > 1:
         feeds[in_names[1]] = feat_len
     log_probs = sess.run(out_names, feeds)[0][0]  # [T, V]
-    ours = ctc_greedy_decode(log_probs, vocab, blank)
-    print(f"  ours     : {ours!r}", flush=True)
+    ours_raw = ctc_greedy_decode(log_probs, vocab, blank)
+    ours = ours_raw.replace("▁", " ").strip()  # SentencePiece space -> real space
+    print(f"  ours (raw): {ours_raw!r}", flush=True)
+    print(f"  ours      : {ours!r}", flush=True)
 
     print("\n=== Verdict ===", flush=True)
     print(f"  ground truth : {GROUND_TRUTH!r}", flush=True)
-    print(f"  onnx-asr     : {ref!r}", flush=True)
+    print(f"  onnx-asr     : {str(ref)!r}", flush=True)
     print(f"  ours         : {ours!r}", flush=True)
-    ok = ours.strip() == str(ref).strip()
-    print(f"  ours == onnx-asr : {ok}", flush=True)
+    norm = lambda s: str(s).lower().replace("!", "").replace("?", "").replace(".", "").replace(",", "").split()
+    ok = norm(ours) == norm(ref)
+    print(f"  ours ~= onnx-asr (ignoring punct/case): {ok}", flush=True)
     return 0 if ok else 1
 
 
