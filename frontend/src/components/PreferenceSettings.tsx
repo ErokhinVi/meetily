@@ -2,8 +2,9 @@
 
 import { useEffect, useState, useRef } from "react"
 import { Switch } from "./ui/switch"
-import { FolderOpen } from "lucide-react"
+import { FolderOpen, RefreshCw } from "lucide-react"
 import { invoke } from "@tauri-apps/api/core"
+import { getVersion } from "@tauri-apps/api/app"
 import Analytics from "@/lib/analytics"
 import AnalyticsConsentSwitch from "./AnalyticsConsentSwitch"
 import { useConfig, NotificationSettings } from "@/contexts/ConfigContext"
@@ -18,6 +19,7 @@ export function PreferenceSettings() {
   } = useConfig();
 
   const [notificationsEnabled, setNotificationsEnabled] = useState<boolean | null>(null);
+  const [appVersion, setAppVersion] = useState<string>('');
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [previousNotificationsEnabled, setPreviousNotificationsEnabled] = useState<boolean | null>(null);
   const hasTrackedViewRef = useRef(false);
@@ -28,6 +30,20 @@ export function PreferenceSettings() {
     // Reset tracking ref on mount (every tab visit)
     hasTrackedViewRef.current = false;
   }, [loadPreferences]);
+
+  // Load the current app version for the Updates section
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch((error) => console.error('Failed to get app version:', error));
+  }, []);
+
+  // Reuse the existing update flow: UpdateCheckProvider listens for this event,
+  // forces a check and opens the shared UpdateDialog.
+  const handleCheckForUpdates = () => {
+    window.dispatchEvent(new CustomEvent('check-updates-from-tray'));
+    void Analytics.track('check_for_updates_clicked', { source: 'settings' });
+  };
 
   // Track preferences viewed analytics on every tab visit (once per mount)
   useEffect(() => {
@@ -217,6 +233,25 @@ export function PreferenceSettings() {
           <p className="text-xs text-blue-800">
             <strong>Note:</strong> Database and models are stored together in your application data directory for unified management.
           </p>
+        </div>
+      </div>
+
+      {/* Software Updates Section */}
+      <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900 mb-2">Software Updates</h3>
+            <p className="text-sm text-gray-600">
+              {appVersion ? `Current version: ${appVersion}` : 'Loading version…'}
+            </p>
+          </div>
+          <button
+            onClick={handleCheckForUpdates}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium border border-gray-300 rounded-md hover:bg-gray-100 transition-colors"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Check for Updates
+          </button>
         </div>
       </div>
 
