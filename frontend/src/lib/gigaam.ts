@@ -34,9 +34,15 @@ export const MODEL_DISPLAY_CONFIG: Record<string, ModelDisplayInfo> = {
   'gigaam-v3-e2e-ctc-int8': {
     friendlyName: 'Lightning',
     icon: '⚡',
-    tagline: 'Real time • Best for speed, great accuracy',
+    tagline: 'Быстрая • реальное время, отличная точность',
     recommended: true,
     tier: 'fastest'
+  },
+  'gigaam-v3-e2e-rnnt-int8': {
+    friendlyName: 'Precise',
+    icon: '🎯',
+    tagline: 'Максимальная точность • RNN-T, чуть медленнее',
+    tier: 'precise'
   }
 };
 

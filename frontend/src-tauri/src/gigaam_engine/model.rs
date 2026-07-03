@@ -1,16 +1,19 @@
-//! GigaAM-v3 e2e-ctc ONNX model wrapper.
+//! GigaAM-v3 ONNX model wrapper (e2e-ctc and e2e-rnnt).
 //!
-//! Pipeline (validated against onnx-asr on CI, see scripts/gigaam_validate.py):
+//! Pipeline (both variants validated against onnx-asr on CI, see
+//! scripts/gigaam_validate.py):
 //!   waveform 16 kHz mono f32
 //!     -> log-mel features [1, 64, T]  (our Rust port of GigaamPreprocessorV3)
-//!     -> encoder ONNX (inputs `features`, `feature_lengths`; output `log_probs`)
-//!     -> greedy CTC decode -> text
+//!     -> CTC:  encoder ONNX (`features`,`feature_lengths` -> `log_probs`)
+//!              -> greedy CTC decode
+//!     -> RNNT: encoder ONNX (`audio_signal`,`length` -> `encoded`,`encoded_len`)
+//!              -> greedy transducer loop (decoder + joiner) -> tokens
 //!
 //! Feature params (GigaAM v3): n_fft = win_length = 320, hop = 160, 64 htk mel
 //! bins, f in [0, 8000], log(clip(mel, 1e-9, 1e9)), NO normalization. Space is
-//! the SentencePiece marker U+2581 in the 257-token vocab (blank = last index).
+//! the SentencePiece marker U+2581 in the vocab (blank = the `<blk>` token).
 
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, ArrayD, Axis, IxDyn};
 use ort::execution_providers::CPUExecutionProvider;
 use ort::inputs;
 use ort::session::builder::GraphOptimizationLevel;
@@ -35,6 +38,16 @@ const CLAMP_MIN: f32 = 1e-9;
 const CLAMP_MAX: f32 = 1e9;
 const SENTENCEPIECE_SPACE: char = '\u{2581}';
 
+// RNN-T decoder LSTM hidden size and max emitted tokens per encoder frame.
+const PRED_HIDDEN: usize = 320;
+const MAX_TOKENS_PER_STEP: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GigaamKind {
+    Ctc,
+    Rnnt,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum GigaamError {
     #[error("ORT error")]
@@ -49,8 +62,19 @@ pub enum GigaamError {
     AudioTooShort(usize),
 }
 
+enum Decode {
+    Ctc {
+        encoder: Session,
+    },
+    Rnnt {
+        encoder: Session,
+        decoder: Session,
+        joiner: Session,
+    },
+}
+
 pub struct GigaamModel {
-    encoder: Session,
+    decode: Decode,
     vocab: Vec<String>,
     blank_idx: usize,
     hann_window: Array1<f32>,
@@ -60,12 +84,33 @@ pub struct GigaamModel {
 }
 
 impl GigaamModel {
-    pub fn new<P: AsRef<Path>>(model_dir: P, quantized: bool) -> Result<Self, GigaamError> {
-        let encoder = Self::init_session(&model_dir, quantized)?;
-        let (vocab, blank_idx) = Self::load_vocab(&model_dir)?;
+    pub fn new<P: AsRef<Path>>(
+        model_dir: P,
+        kind: GigaamKind,
+        quantized: bool,
+    ) -> Result<Self, GigaamError> {
+        let dir = model_dir.as_ref();
+        let (decode, vocab_file) = match kind {
+            GigaamKind::Ctc => (
+                Decode::Ctc {
+                    encoder: init_session(dir, "v3_e2e_ctc", quantized)?,
+                },
+                "v3_e2e_ctc_vocab.txt",
+            ),
+            GigaamKind::Rnnt => (
+                Decode::Rnnt {
+                    encoder: init_session(dir, "v3_e2e_rnnt_encoder", quantized)?,
+                    decoder: init_session(dir, "v3_e2e_rnnt_decoder", quantized)?,
+                    joiner: init_session(dir, "v3_e2e_rnnt_joint", quantized)?,
+                },
+                "v3_e2e_rnnt_vocab.txt",
+            ),
+        };
 
+        let (vocab, blank_idx) = load_vocab(dir.join(vocab_file))?;
         log::info!(
-            "Loaded GigaAM vocabulary with {} tokens, blank_idx={}",
+            "Loaded GigaAM {:?} vocabulary with {} tokens, blank_idx={}",
+            kind,
             vocab.len(),
             blank_idx
         );
@@ -73,81 +118,13 @@ impl GigaamModel {
         let fft = RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT);
 
         Ok(Self {
-            encoder,
+            decode,
             vocab,
             blank_idx,
             hann_window: hann_window(),
             mel_fbank: melscale_fbanks(),
             fft,
         })
-    }
-
-    fn init_session<P: AsRef<Path>>(
-        model_dir: P,
-        try_quantized: bool,
-    ) -> Result<Session, GigaamError> {
-        let providers = vec![CPUExecutionProvider::default().build()];
-
-        let filename = {
-            let quantized = model_dir.as_ref().join("v3_e2e_ctc.int8.onnx");
-            if try_quantized && quantized.exists() {
-                log::info!("Loading quantized GigaAM model (v3_e2e_ctc.int8.onnx)");
-                "v3_e2e_ctc.int8.onnx"
-            } else {
-                log::info!("Loading GigaAM model (v3_e2e_ctc.onnx)");
-                "v3_e2e_ctc.onnx"
-            }
-        };
-
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_execution_providers(providers)?
-            .with_parallel_execution(true)?
-            .commit_from_file(model_dir.as_ref().join(filename))?;
-
-        Ok(session)
-    }
-
-    /// Vocab file lines are "<token> <id>"; blank token is "<blk>".
-    fn load_vocab<P: AsRef<Path>>(model_dir: P) -> Result<(Vec<String>, usize), GigaamError> {
-        let vocab_path = model_dir.as_ref().join("v3_e2e_ctc_vocab.txt");
-        let content = fs::read_to_string(vocab_path)?;
-
-        let mut tokens: Vec<(String, usize)> = Vec::new();
-        let mut blank_idx: Option<usize> = None;
-        let mut max_id = 0usize;
-
-        for line in content.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            // Token may itself be empty or contain spaces; split on the LAST space.
-            let Some((token, id_str)) = line.rsplit_once(' ') else {
-                continue;
-            };
-            let Ok(id) = id_str.trim().parse::<usize>() else {
-                continue;
-            };
-            if token == "<blk>" {
-                blank_idx = Some(id);
-            }
-            tokens.push((token.to_string(), id));
-            max_id = max_id.max(id);
-        }
-
-        let mut vocab = vec![String::new(); max_id + 1];
-        for (token, id) in tokens {
-            vocab[id] = token.replace(SENTENCEPIECE_SPACE, " ");
-        }
-
-        let blank_idx = blank_idx.ok_or_else(|| {
-            GigaamError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Missing <blk> token in GigaAM vocabulary",
-            ))
-        })?;
-
-        Ok((vocab, blank_idx))
     }
 
     /// Full transcription of 16 kHz mono f32 samples.
@@ -158,52 +135,25 @@ impl GigaamModel {
 
         let features = self.log_mel_features(&audio); // [1, 64, T]
         let n_frames = features.shape()[2] as i64;
-        let feature_lengths = Array1::from_vec(vec![n_frames]);
 
-        // Scope the ONNX outputs (which mutably borrow self.encoder) so the
-        // borrow is released before we decode against self.vocab.
-        let (flat, t_out, vocab_size) = {
-            let inputs = inputs![
-                "features" => TensorRef::from_array_view(features.view())?,
-                "feature_lengths" => TensorRef::from_array_view(feature_lengths.view())?,
-            ];
-            let outputs = self.encoder.run(inputs)?;
-            let log_probs = outputs
-                .get("log_probs")
-                .ok_or_else(|| GigaamError::OutputNotFound("log_probs".to_string()))?
-                .try_extract_array::<f32>()?;
-            // log_probs: [1, T', V]
-            let shape = log_probs.shape();
-            let (t_out, vocab_size) = (shape[1], shape[2]);
-            let flat: Vec<f32> = log_probs.iter().copied().collect();
-            (flat, t_out, vocab_size)
-        };
-
-        Ok(self.ctc_greedy_decode(&flat, t_out, vocab_size))
-    }
-
-    /// Greedy CTC: argmax per frame, collapse repeats, drop blank, map to vocab.
-    fn ctc_greedy_decode(&self, log_probs: &[f32], t_out: usize, vocab_size: usize) -> String {
-        let mut text = String::new();
-        let mut prev = usize::MAX;
-        for t in 0..t_out {
-            let row = &log_probs[t * vocab_size..(t + 1) * vocab_size];
-            let mut best = 0usize;
-            let mut best_val = f32::NEG_INFINITY;
-            for (i, &v) in row.iter().enumerate() {
-                if v > best_val {
-                    best_val = v;
-                    best = i;
-                }
+        // Borrow `decode` mutably and `vocab`/`blank_idx` immutably — these are
+        // disjoint fields, so the borrow checker allows it.
+        let vocab = &self.vocab;
+        let blank = self.blank_idx;
+        match &mut self.decode {
+            Decode::Ctc { encoder } => {
+                let (flat, t_out, vocab_size) = run_ctc(encoder, &features, n_frames)?;
+                Ok(ctc_greedy_decode(&flat, t_out, vocab_size, vocab, blank))
             }
-            if best != prev && best != self.blank_idx {
-                if let Some(tok) = self.vocab.get(best) {
-                    text.push_str(tok);
-                }
+            Decode::Rnnt {
+                encoder,
+                decoder,
+                joiner,
+            } => {
+                let tokens = run_rnnt(encoder, decoder, joiner, &features, n_frames, blank)?;
+                Ok(tokens_to_text(&tokens, vocab))
             }
-            prev = best;
         }
-        text.trim().to_string()
     }
 
     /// Port of onnx-asr GigaamPreprocessorV3: STFT (no padding) -> power ->
@@ -217,20 +167,17 @@ impl GigaamModel {
         let mut power = [0.0f32; N_FREQS];
         for f in 0..n_frames {
             let start = f * HOP_LENGTH;
-            // Windowed frame (win_length == n_fft, so no zero padding needed).
             for i in 0..WIN_LENGTH {
                 frame[i] = waveform[start + i] * self.hann_window[i];
             }
 
-            // Real FFT power spectrum: |X[k]|^2 for k in 0..=N_FFT/2.
             self.fft
                 .process(&mut frame, &mut spectrum)
                 .expect("realfft process: buffer lengths are fixed and correct");
-            for (k, c) in spectrum.iter().enumerate() {
-                power[k] = c.re * c.re + c.im * c.im;
+            for (k, cval) in spectrum.iter().enumerate() {
+                power[k] = cval.re * cval.re + cval.im * cval.im;
             }
 
-            // Mel: power [161] x fbank [161, 64] -> [64], then log(clip).
             for m in 0..N_MELS {
                 let mut acc = 0.0f32;
                 for (k, &p) in power.iter().enumerate() {
@@ -241,6 +188,255 @@ impl GigaamModel {
         }
         features
     }
+}
+
+fn init_session<P: AsRef<Path>>(
+    model_dir: P,
+    base_name: &str,
+    try_quantized: bool,
+) -> Result<Session, GigaamError> {
+    let providers = vec![CPUExecutionProvider::default().build()];
+
+    let quantized = model_dir.as_ref().join(format!("{}.int8.onnx", base_name));
+    let filename = if try_quantized && quantized.exists() {
+        format!("{}.int8.onnx", base_name)
+    } else {
+        format!("{}.onnx", base_name)
+    };
+    log::info!("Loading GigaAM ONNX: {}", filename);
+
+    let session = Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_execution_providers(providers)?
+        .with_parallel_execution(true)?
+        .commit_from_file(model_dir.as_ref().join(filename))?;
+
+    Ok(session)
+}
+
+/// Vocab file lines are "<token> <id>"; blank token is "<blk>".
+fn load_vocab<P: AsRef<Path>>(vocab_path: P) -> Result<(Vec<String>, usize), GigaamError> {
+    let content = fs::read_to_string(vocab_path)?;
+
+    let mut tokens: Vec<(String, usize)> = Vec::new();
+    let mut blank_idx: Option<usize> = None;
+    let mut max_id = 0usize;
+
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        // Token may itself be empty or contain spaces; split on the LAST space.
+        let Some((token, id_str)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let Ok(id) = id_str.trim().parse::<usize>() else {
+            continue;
+        };
+        if token == "<blk>" {
+            blank_idx = Some(id);
+        }
+        tokens.push((token.to_string(), id));
+        max_id = max_id.max(id);
+    }
+
+    let mut vocab = vec![String::new(); max_id + 1];
+    for (token, id) in tokens {
+        vocab[id] = token.replace(SENTENCEPIECE_SPACE, " ");
+    }
+
+    let blank_idx = blank_idx.ok_or_else(|| {
+        GigaamError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Missing <blk> token in GigaAM vocabulary",
+        ))
+    })?;
+
+    Ok((vocab, blank_idx))
+}
+
+/// CTC encoder: features [1,64,T] -> log_probs [1, T', V]. Returns (flat, T', V).
+fn run_ctc(
+    encoder: &mut Session,
+    features: &Array3<f32>,
+    n_frames: i64,
+) -> Result<(Vec<f32>, usize, usize), GigaamError> {
+    let feature_lengths = Array1::from_vec(vec![n_frames]);
+    let inputs = inputs![
+        "features" => TensorRef::from_array_view(features.view())?,
+        "feature_lengths" => TensorRef::from_array_view(feature_lengths.view())?,
+    ];
+    let outputs = encoder.run(inputs)?;
+    let log_probs = outputs
+        .get("log_probs")
+        .ok_or_else(|| GigaamError::OutputNotFound("log_probs".to_string()))?
+        .try_extract_array::<f32>()?;
+    let shape = log_probs.shape();
+    let (t_out, vocab_size) = (shape[1], shape[2]);
+    let flat: Vec<f32> = log_probs.iter().copied().collect();
+    Ok((flat, t_out, vocab_size))
+}
+
+/// Greedy CTC: argmax per frame, collapse repeats, drop blank, map to vocab.
+fn ctc_greedy_decode(
+    log_probs: &[f32],
+    t_out: usize,
+    vocab_size: usize,
+    vocab: &[String],
+    blank_idx: usize,
+) -> String {
+    let mut text = String::new();
+    let mut prev = usize::MAX;
+    for t in 0..t_out {
+        let row = &log_probs[t * vocab_size..(t + 1) * vocab_size];
+        let best = argmax(row);
+        if best != prev && best != blank_idx {
+            if let Some(tok) = vocab.get(best) {
+                text.push_str(tok);
+            }
+        }
+        prev = best;
+    }
+    text.trim().to_string()
+}
+
+/// Greedy RNN-T (port of onnx-asr `_AsrWithTransducerDecoding._decoding`).
+fn run_rnnt(
+    encoder: &mut Session,
+    decoder: &mut Session,
+    joiner: &mut Session,
+    features: &Array3<f32>,
+    n_frames: i64,
+    blank_idx: usize,
+) -> Result<Vec<usize>, GigaamError> {
+    // Encoder: audio_signal [1,64,T] + length -> encoded [1,768,T'] + encoded_len.
+    let length = Array1::from_vec(vec![n_frames]);
+    let (encoded, enc_len) = {
+        let inputs = inputs![
+            "audio_signal" => TensorRef::from_array_view(features.view())?,
+            "length" => TensorRef::from_array_view(length.view())?,
+        ];
+        let outputs = encoder.run(inputs)?;
+        let encoded = outputs
+            .get("encoded")
+            .ok_or_else(|| GigaamError::OutputNotFound("encoded".to_string()))?
+            .try_extract_array::<f32>()?
+            .to_owned();
+        let enc_len = outputs
+            .get("encoded_len")
+            .ok_or_else(|| GigaamError::OutputNotFound("encoded_len".to_string()))?
+            .try_extract_array::<i32>()?;
+        let n = enc_len.iter().next().copied().unwrap_or(0) as usize;
+        (encoded, n)
+    };
+
+    let d_model = encoded.shape()[1]; // 768
+    let n = enc_len.min(encoded.shape()[2]);
+
+    // LSTM state (h, c) and cached decoder output.
+    let mut h: ArrayD<f32> = ArrayD::zeros(IxDyn(&[1, 1, PRED_HIDDEN]));
+    let mut c: ArrayD<f32> = ArrayD::zeros(IxDyn(&[1, 1, PRED_HIDDEN]));
+    let mut dec_out: Option<ArrayD<f32>> = None; // None => decoder must run
+    let mut pending_h = h.clone();
+    let mut pending_c = c.clone();
+
+    let mut tokens: Vec<usize> = Vec::new();
+    let mut t = 0usize;
+    let mut emitted = 0usize;
+
+    while t < n {
+        if dec_out.is_none() {
+            let prev = tokens.last().copied().unwrap_or(blank_idx) as i64;
+            let x = Array2::from_shape_vec((1, 1), vec![prev])?;
+            let inputs = inputs![
+                "x" => TensorRef::from_array_view(x.view())?,
+                "h.1" => TensorRef::from_array_view(h.view())?,
+                "c.1" => TensorRef::from_array_view(c.view())?,
+            ];
+            let outputs = decoder.run(inputs)?;
+            dec_out = Some(
+                outputs
+                    .get("dec")
+                    .ok_or_else(|| GigaamError::OutputNotFound("dec".to_string()))?
+                    .try_extract_array::<f32>()?
+                    .to_owned(),
+            );
+            pending_h = outputs
+                .get("h")
+                .ok_or_else(|| GigaamError::OutputNotFound("h".to_string()))?
+                .try_extract_array::<f32>()?
+                .to_owned();
+            pending_c = outputs
+                .get("c")
+                .ok_or_else(|| GigaamError::OutputNotFound("c".to_string()))?
+                .try_extract_array::<f32>()?
+                .to_owned();
+        }
+
+        // joiner: enc = encoded[0,:,t] as [1,768,1]; dec = dec_out^T as [1,320,1].
+        // Transposing [1,1,320] -> [1,320,1] keeps the flat element order, so we
+        // just rebuild the tensor with the reshaped dims.
+        let enc_col: Vec<f32> = encoded
+            .index_axis(Axis(0), 0)
+            .index_axis(Axis(1), t)
+            .iter()
+            .copied()
+            .collect();
+        let enc_in = Array3::from_shape_vec((1, d_model, 1), enc_col)?;
+        let dec_ref = dec_out.as_ref().expect("dec_out set above");
+        let dec_flat: Vec<f32> = dec_ref.iter().copied().collect();
+        let dec_in = Array3::from_shape_vec((1, dec_flat.len(), 1), dec_flat)?;
+
+        let token = {
+            let inputs = inputs![
+                "enc" => TensorRef::from_array_view(enc_in.view())?,
+                "dec" => TensorRef::from_array_view(dec_in.view())?,
+            ];
+            let outputs = joiner.run(inputs)?;
+            let joint = outputs
+                .get("joint")
+                .ok_or_else(|| GigaamError::OutputNotFound("joint".to_string()))?
+                .try_extract_array::<f32>()?;
+            let flat: Vec<f32> = joint.iter().copied().collect(); // [1,1,1,V] -> V
+            argmax(&flat)
+        };
+
+        if token != blank_idx {
+            h = pending_h.clone();
+            c = pending_c.clone();
+            dec_out = None;
+            tokens.push(token);
+            emitted += 1;
+        }
+        if token == blank_idx || emitted == MAX_TOKENS_PER_STEP {
+            t += 1;
+            emitted = 0;
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn tokens_to_text(tokens: &[usize], vocab: &[String]) -> String {
+    let mut text = String::new();
+    for &t in tokens {
+        if let Some(tok) = vocab.get(t) {
+            text.push_str(tok);
+        }
+    }
+    text.trim().to_string()
+}
+
+fn argmax(row: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in row.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best = i;
+        }
+    }
+    best
 }
 
 fn hann_window() -> Array1<f32> {

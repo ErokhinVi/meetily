@@ -14,7 +14,7 @@ use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
-use crate::gigaam_engine::model::GigaamModel;
+use crate::gigaam_engine::model::{GigaamKind, GigaamModel};
 
 const HF_BASE: &str = "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main";
 
@@ -47,24 +47,40 @@ pub struct DownloadProgress {
 
 pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send + Sync>;
 
-/// One registry entry: (model name, [(remote filename, local filename, size bytes)], size_mb, description).
+/// One registry entry: (model name, kind, [(remote filename, local filename, size bytes)], size_mb, description).
 struct ModelSpec {
     name: &'static str,
+    kind: GigaamKind,
     files: &'static [(&'static str, &'static str, u64)],
     size_mb: u32,
     description: &'static str,
 }
 
-// int8 quantized e2e-ctc: punctuation + text normalization, ~225 MB.
-const REGISTRY: &[ModelSpec] = &[ModelSpec {
-    name: "gigaam-v3-e2e-ctc-int8",
-    files: &[
-        ("v3_e2e_ctc.int8.onnx", "v3_e2e_ctc.int8.onnx", 224_891_000),
-        ("v3_e2e_ctc_vocab.txt", "v3_e2e_ctc_vocab.txt", 3_000),
-    ],
-    size_mb: 225,
-    description: "GigaAM-v3 (Сбер) — русский, с пунктуацией и нормализацией текста",
-}];
+// int8 quantized, both ~225 MB. CTC is faster; RNN-T is the more accurate variant.
+const REGISTRY: &[ModelSpec] = &[
+    ModelSpec {
+        name: "gigaam-v3-e2e-ctc-int8",
+        kind: GigaamKind::Ctc,
+        files: &[
+            ("v3_e2e_ctc.int8.onnx", "v3_e2e_ctc.int8.onnx", 224_891_000),
+            ("v3_e2e_ctc_vocab.txt", "v3_e2e_ctc_vocab.txt", 3_000),
+        ],
+        size_mb: 225,
+        description: "GigaAM-v3 CTC (Сбер) — русский, быстрый, с пунктуацией",
+    },
+    ModelSpec {
+        name: "gigaam-v3-e2e-rnnt-int8",
+        kind: GigaamKind::Rnnt,
+        files: &[
+            ("v3_e2e_rnnt_encoder.int8.onnx", "v3_e2e_rnnt_encoder.int8.onnx", 224_570_000),
+            ("v3_e2e_rnnt_decoder.int8.onnx", "v3_e2e_rnnt_decoder.int8.onnx", 1_160_000),
+            ("v3_e2e_rnnt_joint.int8.onnx", "v3_e2e_rnnt_joint.int8.onnx", 690_000),
+            ("v3_e2e_rnnt_vocab.txt", "v3_e2e_rnnt_vocab.txt", 12_000),
+        ],
+        size_mb: 226,
+        description: "GigaAM-v3 RNN-T (Сбер) — русский, максимальная точность, с пунктуацией",
+    },
+];
 
 fn spec(name: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().find(|m| m.name == name)
@@ -162,8 +178,9 @@ impl GigaamEngine {
             return Err(anyhow!("GigaAM model '{}' is not fully downloaded", name));
         }
         let dir = self.model_dir(name);
+        let kind = s.kind;
         // GigaamModel::new is CPU/IO heavy; run it off the async executor.
-        let model = tokio::task::spawn_blocking(move || GigaamModel::new(&dir, true))
+        let model = tokio::task::spawn_blocking(move || GigaamModel::new(&dir, kind, true))
             .await
             .map_err(|e| anyhow!("load task join error: {}", e))?
             .map_err(|e| anyhow!("Failed to load GigaAM model: {}", e))?;

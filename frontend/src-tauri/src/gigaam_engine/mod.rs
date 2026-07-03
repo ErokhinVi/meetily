@@ -5,3 +5,4 @@ pub mod gigaam_engine;
 pub mod model;
 
 pub use gigaam_engine::{DownloadProgress, GigaamEngine, ModelInfo, ModelStatus};
+pub use model::GigaamKind;
