@@ -1,0 +1,30 @@
+name: "GigaAM validate"
+
+# Auto-runs on push to the gigaam-validate branch (no default-branch dispatch
+# needed). Validates the GigaAM-v3 e2e-ctc pipeline + our numpy log-mel port
+# against onnx-asr before it is reimplemented in Rust.
+
+on:
+  push:
+    branches: [gigaam-validate]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "onnx-asr[cpu,hub]" onnxruntime numpy soundfile librosa gTTS huggingface_hub
+
+      - name: Run validation
+        run: python scripts/gigaam_validate.py
